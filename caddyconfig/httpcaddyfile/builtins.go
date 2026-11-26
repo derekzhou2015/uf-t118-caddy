@@ -61,10 +61,25 @@ func init() {
 //		bind <addresses...> [{
 //	   protocols [h1|h2|h2c|h3] [...]
 //	 }]
+//
+// Each address is a listener host, optionally prefixed with a network and,
+// for TCP/UDP addresses, suffixed with an explicit port or inclusive port
+// range (e.g. "127.0.0.1:8080", "[::1]:443" or ":8080-8090"). A port-less
+// address inherits the site address port. Malformed or out-of-range ports
+// are a parse error carrying the address's config line. Unix socket and file
+// descriptor addresses never take a port.
 func parseBind(h Helper) ([]ConfigValue, error) {
 	h.Next() // consume directive name
 	var addresses, protocols []string
-	addresses = h.RemainingArgs()
+	for h.NextArg() {
+		arg := h.Val()
+		// validate up front, while the dispenser token points at the
+		// offending address, so the error carries its config line number
+		if _, _, _, err := splitBindAddress(arg); err != nil {
+			return nil, h.WrapErr(err)
+		}
+		addresses = append(addresses, arg)
+	}
 
 	for h.NextBlock(0) {
 		switch h.Val() {

@@ -326,23 +326,31 @@ func (st *ServerType) listenersForServerBlockAddress(sblock serverBlock, addr Ad
 		}
 	}
 
-	// use a map to prevent duplication
+	// use a map to prevent duplication; an explicit port (or port range) on
+	// a bind address is honored, while addresses without one inherit the
+	// site-derived lnPort. Consequently, several explicit ports on the same
+	// host produce distinct listeners instead of being merged together.
 	listeners := map[string]map[string]struct{}{}
 	for _, lnCfgVal := range lnCfgVals {
 		for _, lnAddr := range lnCfgVal.addresses {
-			lnNetw, lnHost, _, err := caddy.SplitNetworkAddress(lnAddr)
+			lnNetw, lnHost, lnExplicitPort, err := splitBindAddress(lnAddr)
 			if err != nil {
 				return nil, fmt.Errorf("splitting listener address: %v", err)
 			}
-			networkAddr, err := caddy.ParseNetworkAddress(caddy.JoinNetworkAddress(lnNetw, lnHost, lnPort))
+			effectivePort := lnPort
+			if lnExplicitPort != "" {
+				effectivePort = lnExplicitPort
+			}
+			networkAddr, err := caddy.ParseNetworkAddress(caddy.JoinNetworkAddress(lnNetw, lnHost, effectivePort))
 			if err != nil {
 				return nil, fmt.Errorf("parsing network address: %v", err)
 			}
-			if _, ok := listeners[addr.String()]; !ok {
-				listeners[networkAddr.String()] = map[string]struct{}{}
+			listenAddr := networkAddr.String()
+			if _, ok := listeners[listenAddr]; !ok {
+				listeners[listenAddr] = map[string]struct{}{}
 			}
 			for _, protocol := range lnCfgVal.protocols {
-				listeners[networkAddr.String()][protocol] = struct{}{}
+				listeners[listenAddr][protocol] = struct{}{}
 			}
 		}
 	}
@@ -355,6 +363,159 @@ func (st *ServerType) listenersForServerBlockAddress(sblock serverBlock, addr Ad
 type addressesWithProtocols struct {
 	addresses []string
 	protocols []string
+}
+
+// splitBindAddress splits a single address argument accepted by the 'bind'
+// directive (and by the 'default_bind' global option) into its network, host
+// and an optional explicit port or inclusive port range.
+//
+// The port is normally inherited from the site address by the caller, but an
+// explicitly specified port/range is returned here so it can be honored
+// instead of being silently dropped. Any explicit port is validated with the
+// same wording as ParseAddress's port violations.
+//
+// Unix socket and file descriptor addresses are returned with their host
+// (the socket path or descriptor reference, which may itself contain colons)
+// untouched and never carry a port.
+func splitBindAddress(raw string) (network, host, portRange string, err error) {
+	network, host, port, err := caddy.SplitNetworkAddress(raw)
+	if err != nil {
+		return network, host, "", err
+	}
+
+	// unix sockets and fds have no port; SplitNetworkAddress already kept
+	// the whole path/name (including any colons) as the host
+	if caddy.IsUnixNetwork(network) || caddy.IsFdNetwork(network) {
+		return network, host, "", nil
+	}
+
+	if port == "" {
+		// the standard parser did not recognize a port; recover the
+		// otherwise-ambiguous unbracketed-IPv6-with-port[-range] form,
+		// which it glues into the host and would turn into an invalid
+		// listener once the site port is joined
+		if v6Host, v6Port, ok := splitBareIPv6ExplicitPort(host); ok {
+			host, port = v6Host, v6Port
+		}
+	}
+
+	if port != "" {
+		if err := validateBindPort(port); err != nil {
+			return network, host, port, err
+		}
+	}
+
+	return network, host, port, nil
+}
+
+// splitBareIPv6ExplicitPort detects an unbracketed IPv6 literal written with
+// a trailing :port or :start-end port range, for example "::1:443" or
+// "::1:4000-4099", and returns the canonical IPv6 host and port/range.
+//
+// Such a string is inherently ambiguous with a real IPv6 literal, so a
+// suffix is peeled off only when the suffix is numeric (or a numeric range)
+// and what remains parses as an IPv6 address. A genuinely port-less bare
+// literal such as "::1" cannot satisfy that (dropping its trailing group
+// leaves ":") and is therefore left untouched.
+func splitBareIPv6ExplicitPort(host string) (string, string, bool) {
+	lastColon := strings.LastIndexByte(host, ':')
+	if lastColon < 0 || lastColon == len(host)-1 {
+		return "", "", false
+	}
+	prefix := host[:lastColon]
+	suffix := host[lastColon+1:]
+
+	start, end, isRange := strings.Cut(suffix, "-")
+	if !isDecimalPort(start) {
+		return "", "", false
+	}
+	if isRange && !isDecimalPort(end) {
+		return "", "", false
+	}
+
+	ip, err := netip.ParseAddr(prefix)
+	if err != nil || !(ip.Is6() && !ip.Is4() && !ip.Is4In6()) {
+		return "", "", false
+	}
+
+	if isRange {
+		return ip.String(), start + "-" + end, true
+	}
+	return ip.String(), start, true
+}
+
+// isDecimalPort reports whether s is a non-empty string of ASCII digits.
+func isDecimalPort(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validateBindPort validates a single port or an inclusive "start-end" port
+// range. The wording for an invalid/out-of-range port matches the existing
+// port violation precedent in ParseAddress (and the ordering error matches
+// caddy.ParseNetworkAddress).
+func validateBindPort(port string) error {
+	// a single port number, including a negative one (which must report the
+	// same "port -1 is out of range" precedent as ParseAddress)
+	if n, err := strconv.Atoi(port); err == nil {
+		if n < 0 || n > 65535 {
+			return fmt.Errorf("port %d is out of range", n)
+		}
+		return nil
+	}
+
+	startStr, endStr, isRange := strings.Cut(port, "-")
+	if !isRange {
+		_, err := strconv.Atoi(port)
+		return fmt.Errorf("invalid port '%s': %v", port, err)
+	}
+
+	start, err := strconv.Atoi(startStr)
+	if err != nil {
+		return fmt.Errorf("invalid port '%s': %v", startStr, err)
+	}
+	if start < 0 || start > 65535 {
+		return fmt.Errorf("port %d is out of range", start)
+	}
+
+	end, err := strconv.Atoi(endStr)
+	if err != nil {
+		return fmt.Errorf("invalid port '%s': %v", endStr, err)
+	}
+	if end < 0 || end > 65535 {
+		return fmt.Errorf("port %d is out of range", end)
+	}
+	if end < start {
+		return fmt.Errorf("end port must not be less than start port")
+	}
+	if uint64(end-start)+1 > maxBindPortSpan {
+		return fmt.Errorf("port range exceeds %d ports", maxBindPortSpan)
+	}
+	return nil
+}
+
+// maxBindPortSpan mirrors the maximum port span enforced by
+// caddy.ParseNetworkAddress (listeners.go).
+const maxBindPortSpan = 65535
+
+// bindHostFromAddr returns just the host portion of a bind/default_bind
+// address for use as an ACME challenge bind host; it must never carry a
+// network prefix or port, which could contradict the actual listener.
+func bindHostFromAddr(addr string) string {
+	_, host, _, err := splitBindAddress(addr)
+	if err != nil {
+		// addresses are validated while parsing the Caddyfile, so this is a
+		// defensive best-effort fallback
+		_, host, _, _ = caddy.SplitNetworkAddress(addr)
+	}
+	return host
 }
 
 // Address represents a site address. It contains

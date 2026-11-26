@@ -341,7 +341,15 @@ func parseOptDefaultBind(d *caddyfile.Dispenser, _ any) (any, error) {
 	d.Next() // consume option name
 
 	var addresses, protocols []string
-	addresses = d.RemainingArgs()
+	for d.NextArg() {
+		arg := d.Val()
+		// apply the same address/port rules (and line-accurate errors) as
+		// the site-level bind directive
+		if _, _, _, err := splitBindAddress(arg); err != nil {
+			return nil, d.WrapErr(err)
+		}
+		addresses = append(addresses, arg)
+	}
 
 	if len(addresses) == 0 {
 		addresses = append(addresses, "")

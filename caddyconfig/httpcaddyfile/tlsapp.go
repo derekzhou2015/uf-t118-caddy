@@ -204,7 +204,7 @@ func (st ServerType) buildTLSApp(
 						// only binding to one host is supported
 						var bindHost string
 						if asserted, ok := cfgVal.Value.(addressesWithProtocols); ok && len(asserted.addresses) > 0 {
-							bindHost = asserted.addresses[0]
+							bindHost = bindHostFromAddr(asserted.addresses[0])
 						}
 						acmeIssuer.Challenges.BindHost = bindHost
 					}
@@ -647,7 +647,7 @@ func fillInGlobalACMEDefaults(issuer certmagic.Issuer, options map[string]any) e
 				if acmeIssuer.Challenges == nil {
 					acmeIssuer.Challenges = new(caddytls.ChallengesConfig)
 				}
-				acmeIssuer.Challenges.BindHost = abp.addresses[0]
+				acmeIssuer.Challenges.BindHost = bindHostFromAddr(abp.addresses[0])
 			}
 		}
 	}
